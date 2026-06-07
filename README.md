@@ -19,6 +19,33 @@ MessageDelta.patch({ text: "hello" }, controlled)
 // { text: "hello world" }
 ```
 
+## Streaming over Effect RPC
+
+For an assistant message with nested content, usage, citations, and status, the
+backend can author patches directly and stream them to the frontend:
+
+```ts
+// backend
+const patch = AssistantMessageDelta.fromUpdate({
+  content: { text: Delta.append(chunk) }
+})
+yield* Queue.offer(outgoing, Schema.decodeUnknownSync(PatchWire)(patch))
+
+// frontend
+yield* client.StreamMessage().pipe(
+  Stream.runForEach((patch) =>
+    Effect.sync(() => {
+      message = AssistantMessageDelta.patch(message, patch)
+    })
+  )
+)
+```
+
+See [`examples/effect-rpc.ts`](./examples/effect-rpc.ts) for the shared RPC
+contract, backend handler, and frontend consumer. The example defines a small
+wire Schema for the patch subset accepted by that endpoint, so RPC validates
+patches at the transport boundary.
+
 `Delta.make(schema)` implements Effect's `Differ.Differ<Value, Patch>` and adds
 `fromUpdate`. Automatic string and array diffs conservatively replace. Append is
 explicit and is supported by string and variable-length array schemas. Checked
