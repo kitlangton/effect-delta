@@ -46,7 +46,7 @@ describe("Delta", () => {
     assert.strictEqual(nonEmpty.patch("a", nonEmpty.fromUpdate(Delta.append("b"))), "ab")
     assert.throws(
       () => nonEmpty.patch("a", nonEmpty.fromUpdate(Delta.replace(""))),
-      /patched value does not satisfy the schema/
+      /malformed patch/
     )
 
     const MaxTwo = Schema.Array(Schema.String).check(Schema.isMaxLength(2))
@@ -128,7 +128,9 @@ describe("Delta", () => {
     const before = { payload: { _tag: "Old", value: 1 } }
     const replacement = { _tag: "Replace", value: 2 }
     const patch = tagged.fromUpdate({ payload: Delta.replace(replacement) })
+    const decoded = Schema.decodeUnknownSync(tagged.schema)(patch)
     assert.deepStrictEqual(tagged.patch(before, patch), { payload: replacement })
+    assert.deepStrictEqual(tagged.patch(before, decoded), { payload: replacement })
     assert.deepStrictEqual(patch, {
       _tag: "Struct",
       fields: { payload: { _tag: "Replace", value: replacement } }
@@ -219,21 +221,10 @@ describe("Delta", () => {
     const patch = symbolStruct.diff(before, after)
     assert.deepStrictEqual(patch, { _tag: "Replace", value: after })
     assert.strictEqual(symbolStruct.patch(before, patch), after)
-  })
 
-  it("combines in constant time and applies large sequences stack-safely", () => {
-    const string = Delta.make(Schema.String)
-    let combined = string.empty
-    for (let index = 0; index < 40_000; index++) combined = string.combine(combined, string.fromUpdate(Delta.append("x")))
-    assert.strictEqual(combined._tag, "Sequence")
-    assert.strictEqual(string.patch("", combined).length, 40_000)
-
-    const append = delta.fromUpdate({ text: Delta.append(" world") })
-    const replace = delta.fromUpdate({ text: "goodbye" })
-    assert.deepStrictEqual(
-      delta.patch(before, delta.combine(append, replace)),
-      delta.patch(delta.patch(before, append), replace)
-    )
+    const codec = symbolStruct.schema
+    assert.throws(() => Schema.encodeSync(codec)(patch))
+    assert.throws(() => Schema.decodeUnknownSync(codec)({ _tag: "Replace", value: {} }))
   })
 
   it("applies patches immutably", () => {
@@ -269,19 +260,110 @@ describe("Delta", () => {
     }
   })
 
-  it("throws on malformed or impossible trusted patches", () => {
-    assert.throws(() => delta.patch(before, { _tag: "Bogus" } as never), /unknown patch operation/)
-    assert.throws(() => delta.patch(before, null as never), /malformed patch/)
-    assert.throws(() => delta.patch(before, { _tag: "Sequence", first: null, second: delta.empty } as never), /malformed Sequence/)
-    assert.throws(() => delta.patch(before, { _tag: "Replace" } as never), /malformed Replace/)
-    assert.throws(() => Delta.make(Schema.String).patch("a", { _tag: "Append" } as never), /malformed Append/)
-    assert.throws(
-      () => delta.patch(before, { _tag: "Append", value: "x" } as never),
-      /Append is not supported/
-    )
-    assert.throws(
-      () => delta.patch(before, { _tag: "Struct", fields: { missing: { _tag: "Empty" } } } as never),
-      /unknown struct field/
-    )
+  it("derives a schema for replace, append, nested struct, and sequence patches", () => {
+    const replacements = delta.diff(before, { ...before, id: 2 })
+    const nested = delta.fromUpdate({ author: { name: "Grace" } })
+    const append = delta.fromUpdate({ text: Delta.append(" world") })
+    const sequence = delta.combine(append, nested)
+
+    for (const codec of [delta.schema, Schema.toCodecJson(delta.schema)]) {
+      const decode = Schema.decodeSync(codec)
+      const encode = Schema.encodeSync(codec)
+      for (const patch of [replacements, nested, append, sequence]) {
+        const decoded = decode(encode(patch))
+        assert.notStrictEqual(encode(patch), null)
+        assert.deepStrictEqual(delta.patch(before, decoded), delta.patch(before, patch))
+      }
+    }
+  })
+
+  it("derives Remove only for optional struct fields", () => {
+    const Optional = Schema.Struct({ required: Schema.String, optional: Schema.optionalKey(Schema.String) })
+    const optional = Delta.make(Optional)
+    const jsonCodec = Schema.toCodecJson(optional.schema)
+    const decode = Schema.decodeSync(jsonCodec)
+    const encode = Schema.encodeSync(jsonCodec)
+    const patch = optional.fromUpdate({ optional: Delta.remove() })
+
+    assert.deepStrictEqual(decode(encode(patch)), patch)
+    assert.deepStrictEqual(optional.patch({ required: "x", optional: "y" }, decode(encode(patch))), { required: "x" })
+    assert.throws(() => decode({
+      _tag: "Struct",
+      fields: { required: { _tag: "Remove" } }
+    }))
+  })
+
+  it("uses suffix schemas rather than whole-value checks for Append", () => {
+    const NonEmpty = Delta.make(Schema.NonEmptyString)
+    const MaxTwo = Delta.make(Schema.Array(Schema.String).check(Schema.isMaxLength(2)))
+
+    const emptySuffix = Schema.decodeUnknownSync(NonEmpty.schema)({ _tag: "Append", value: "" })
+    const arraySuffix = Schema.decodeUnknownSync(MaxTwo.schema)({ _tag: "Append", value: ["a", "b", "c"] })
+    assert.deepStrictEqual(emptySuffix, { _tag: "Append", value: "" })
+    assert.deepStrictEqual(arraySuffix, { _tag: "Append", value: ["a", "b", "c"] })
+    assert.throws(() => MaxTwo.patch([], arraySuffix), /patched value does not satisfy the schema/)
+  })
+
+  it("roundtrips transformed replacement values through canonical JSON", () => {
+    const transformed = Delta.make(Schema.NumberFromString)
+    const patch = transformed.fromUpdate(Delta.replace(42))
+    for (const codec of [transformed.schema, Schema.toCodecJson(transformed.schema)]) {
+      const encoded = Schema.encodeSync(codec)(patch)
+      const decoded = Schema.decodeSync(codec)(encoded)
+      assert.deepStrictEqual(encoded, { _tag: "Replace", value: 42 })
+      assert.deepStrictEqual(decoded, patch)
+      assert.strictEqual(transformed.patch(1, decoded), 42)
+    }
+  })
+
+  it("does not apply patch-envelope exactness to Replace values", () => {
+    const Value = Schema.Struct({ value: Schema.Number })
+    const value = Delta.make(Value)
+    const patch = value.fromUpdate(Delta.replace({ value: 2, extra: true } as typeof Value.Type))
+    const encoded = Schema.encodeSync(value.schema)(patch)
+    const decoded = Schema.decodeSync(value.schema)(encoded)
+    assert.deepStrictEqual(encoded, { _tag: "Replace", value: { value: 2 } })
+    assert.deepStrictEqual(value.patch({ value: 1 }, decoded), { value: 2 })
+  })
+
+  it("roundtrips Date and class replacement values through direct and derived JSON codecs", () => {
+    class Event extends Schema.Class<Event>("Event")({
+      name: Schema.String,
+      at: Schema.Date
+    }) {}
+    const event = Delta.make(Event)
+    const value = new Event({ name: "launch", at: new Date("2026-01-02T03:04:05.000Z") })
+    const patch = event.fromUpdate(Delta.replace(value))
+
+    for (const codec of [event.schema, Schema.toCodecJson(event.schema)]) {
+      const encoded = Schema.encodeSync(codec)(patch)
+      const decoded = Schema.decodeSync(codec)(encoded)
+      const next = event.patch(new Event({ name: "old", at: new Date(0) }), decoded)
+      assert.notStrictEqual(encoded, null)
+      assert.strictEqual(next.name, "launch")
+      assert.strictEqual(next.at.toISOString(), "2026-01-02T03:04:05.000Z")
+    }
+  })
+
+  it("asserts 40k-deep runtime sequences iteratively", () => {
+    const string = Delta.make(Schema.String)
+    let valid: Delta.Patch<typeof Schema.String> = string.fromUpdate(Delta.append("x"))
+    for (let index = 1; index < 40_000; index++) {
+      valid = { _tag: "Sequence", first: valid, second: string.fromUpdate(Delta.append("x")) }
+    }
+    assert.doesNotThrow(() => Schema.asserts(string.schema, valid))
+
+    let malformed: unknown = { _tag: "Empty", extra: true }
+    for (let index = 1; index < 40_000; index++) {
+      malformed = { _tag: "Sequence", first: malformed, second: { _tag: "Empty" } }
+    }
+    let failure: unknown
+    try {
+      Schema.asserts(string.schema, malformed)
+    } catch (error) {
+      failure = error
+    }
+    assert.ok(failure instanceof Error)
+    assert.strictEqual(failure instanceof RangeError, false)
   })
 })

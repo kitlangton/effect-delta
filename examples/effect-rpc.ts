@@ -16,56 +16,9 @@ const AssistantMessage = Schema.Struct({
 })
 const AssistantMessageDelta = Delta.make(AssistantMessage)
 
-// Version 0.1 does not derive a patch Schema, so this endpoint declares the
-// exact patch variants it transports.
-const TextChunkPatch = Schema.Struct({
-  _tag: Schema.Literal("Struct"),
-  fields: Schema.Struct({
-    content: Schema.Struct({
-      _tag: Schema.Literal("Struct"),
-      fields: Schema.Struct({
-        text: Schema.Struct({
-          _tag: Schema.Literal("Append"),
-          value: Schema.String
-        })
-      })
-    })
-  })
-})
-
-const CompletedPatch = Schema.Struct({
-  _tag: Schema.Literal("Struct"),
-  fields: Schema.Struct({
-    content: Schema.Struct({
-      _tag: Schema.Literal("Struct"),
-      fields: Schema.Struct({
-        citations: Schema.Struct({
-          _tag: Schema.Literal("Append"),
-          value: Schema.Array(Schema.String)
-        })
-      })
-    }),
-    usage: Schema.Struct({
-      _tag: Schema.Literal("Struct"),
-      fields: Schema.Struct({
-        outputTokens: Schema.Struct({
-          _tag: Schema.Literal("Replace"),
-          value: Schema.Number
-        })
-      })
-    }),
-    status: Schema.Struct({
-      _tag: Schema.Literal("Replace"),
-      value: Schema.Literal("complete")
-    })
-  })
-})
-
-const AssistantMessagePatchWire = Schema.Union([TextChunkPatch, CompletedPatch])
-
 class StreamAssistantMessage extends Rpc.make("StreamAssistantMessage", {
   payload: { messageId: Schema.String },
-  success: AssistantMessagePatchWire,
+  success: AssistantMessageDelta.schema,
   stream: true
 }) {}
 
@@ -75,9 +28,8 @@ export const MessageRpcs = RpcGroup.make(StreamAssistantMessage)
 export const MessageRpcsLive = MessageRpcs.toLayer(Effect.gen(function*() {
   return MessageRpcs.of({
     StreamAssistantMessage: Effect.fnUntraced(function*() {
-      const outgoing = yield* Queue.unbounded<typeof AssistantMessagePatchWire.Type, Cause.Done>()
-      const send = (patch: unknown) =>
-        Queue.offer(outgoing, Schema.decodeUnknownSync(AssistantMessagePatchWire)(patch))
+      const outgoing = yield* Queue.unbounded<typeof AssistantMessageDelta.schema.Type, Cause.Done>()
+      const send = (patch: typeof AssistantMessageDelta.schema.Type) => Queue.offer(outgoing, patch)
 
       yield* Effect.forEach(["Effect", " RPC", " streams patches."], (chunk) =>
         send(AssistantMessageDelta.fromUpdate({
@@ -103,7 +55,7 @@ export const consumeMessage = (
   client: {
     readonly StreamAssistantMessage: (
       payload: { readonly messageId: string }
-    ) => Stream.Stream<typeof AssistantMessagePatchWire.Type>
+    ) => Stream.Stream<typeof AssistantMessageDelta.schema.Type>
   }
 ) =>
   Effect.gen(function*() {

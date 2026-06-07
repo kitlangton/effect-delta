@@ -61,13 +61,25 @@ know they received a suffix.
    transforms, index signatures, primitives, unknown values, and other
    unsupported shapes use replacement.
 6. Replacement is the universal fallback and can also be authored explicitly.
-7. Patches are trusted typed values. A patch Schema and external-data validation
-   are deferred until they can be derived faithfully.
+7. Every delta exposes a faithfully derived `schema` for validating patch data
+   at external boundaries. Replacement payloads use the decoded value schema;
+   append payloads use unconstrained suffix or element schemas because
+   whole-value checks are enforced after patch application. Its encoded type is
+   canonical JSON. Binary runtime sequences flatten to a non-recursive array of
+   at least two operations and decode to an application-equivalent balanced
+   tree; structural runtime-tree identity is not a codec law. Replacement wire
+   values follow the value Schema's canonical codec and may normalize accepted
+   decoded values, including stripping excess object properties. Schema access
+   is total; unsupported canonical payloads fail at the Replace transport
+   boundary. Unannotated declarations fail encoding and decoding unless they
+   supply Effect `toCodecJson` or `toCodec` annotations, preventing lossy null
+   transport.
 
 ## Status
 
 Initial 0.1 implementation complete and publication checks covered. Checked
 schemas retain safe structural authoring and reject invalid final values.
 Literals, templates, brands, tuples, symbol-keyed structs, and unsupported
-shapes are rejected statically. Recursive and custom derivation, patch Schemas,
-and schema-evolution guarantees remain future work.
+shapes are rejected statically. The patch Schema covers every runtime patch
+capability, including recursive binary sequences. Recursive domain derivation,
+custom derivation, and schema-evolution guarantees remain future work.

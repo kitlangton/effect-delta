@@ -1,5 +1,12 @@
 import type { Differ } from "effect"
-import { Predicate, Record as EffectRecord, Schema, SchemaAST } from "effect"
+import { Predicate, Record as EffectRecord, Schema } from "effect"
+import {
+  deriveDescriptor,
+  derivePatchSchema,
+  isRuntimePatch,
+  type Descriptor,
+  type RuntimePatch
+} from "./internal/patchSchema.ts"
 
 /** A patch that leaves its input unchanged. */
 export interface Empty {
@@ -89,6 +96,8 @@ type RootUpdate<S extends Schema.Top> =
 
 /** A schema-derived Effect Differ with direct authoring support. */
 export interface Delta<S extends Schema.Schema<unknown>> extends Differ.Differ<S["Type"], Patch<S>> {
+  /** Schema for exactly the patch values accepted by this delta. */
+  readonly schema: Schema.Codec<Patch<S>, Schema.Json>
   /** Converts an unambiguous authoring command or struct update into patch data. */
   readonly fromUpdate: (update: RootUpdate<S>) => Patch<S>
 }
@@ -106,14 +115,6 @@ export const append = <A extends string | ReadonlyArray<unknown>>(value: A): App
 
 /** Authors removal of an optional struct field. */
 export const remove = (): RemoveCommand => ({ [commandTypeId]: "Remove" })
-
-type RuntimePatch =
-  | Empty
-  | Replace<unknown>
-  | Append<string | ReadonlyArray<unknown>>
-  | Remove
-  | { readonly _tag: "Struct"; readonly fields: Readonly<Record<string, RuntimePatch>> }
-  | { readonly _tag: "Sequence"; readonly first: RuntimePatch; readonly second: RuntimePatch }
 
 interface RuntimeDelta {
   readonly kind: "replace" | "string" | "array" | "struct"
@@ -157,38 +158,12 @@ const clone = (input: object): Record<string, unknown> => {
 
 const makeFields = (): Record<string, RuntimePatch> => Object.create(null) as Record<string, RuntimePatch>
 
-const isPlainStruct = (ast: SchemaAST.AST): ast is SchemaAST.Objects =>
-  SchemaAST.isObjects(ast) &&
-  ast.encoding === undefined &&
-  ast.propertySignatures.length > 0 &&
-  ast.indexSignatures.length === 0 &&
-  ast.propertySignatures.every((property) => typeof property.name === "string")
-
-const isAppendString = (ast: SchemaAST.AST): boolean =>
-  SchemaAST.isString(ast) && ast.encoding === undefined
-
-const isAppendArray = (ast: SchemaAST.AST): boolean =>
-  SchemaAST.isArrays(ast) &&
-  ast.encoding === undefined &&
-  ast.elements.length === 0 &&
-  ast.rest.length === 1
-
 const apply = (delta: RuntimeDelta, oldValue: unknown, patch: RuntimePatch): unknown => {
   let value = oldValue
   const pending = [patch]
   while (pending.length > 0) {
     const current = pending.pop() as RuntimePatch
-    if (!Predicate.isObject(current) || typeof current._tag !== "string") return fail("malformed patch")
     if (current._tag === "Sequence") {
-      if (!Object.hasOwn(current, "first") || !Object.hasOwn(current, "second")) {
-        return fail("malformed Sequence patch")
-      }
-      if (
-        !Predicate.isObject(current.first) || typeof current.first._tag !== "string" ||
-        !Predicate.isObject(current.second) || typeof current.second._tag !== "string"
-      ) {
-        return fail("malformed Sequence patch")
-      }
       pending.push(current.second, current.first)
     } else {
       value = delta.patchOne(value, current)
@@ -216,13 +191,13 @@ const fromCommand = (delta: RuntimeDelta, input: unknown): RuntimePatch | undefi
   }
 }
 
-const derive = (ast: SchemaAST.AST): RuntimeDelta => {
-  if (isPlainStruct(ast)) {
+const derive = (descriptor: Descriptor): RuntimeDelta => {
+  if (descriptor.fields !== undefined) {
     const fields = new Map<string, RuntimeField>()
-    for (const property of ast.propertySignatures) {
-      fields.set(String(property.name), {
-        delta: derive(property.type),
-        optional: SchemaAST.isOptional(property.type)
+    for (const [name, field] of descriptor.fields) {
+      fields.set(name, {
+        delta: derive(field.descriptor),
+        optional: field.optional
       })
     }
 
@@ -278,22 +253,16 @@ const derive = (ast: SchemaAST.AST): RuntimeDelta => {
         case "Empty":
           return oldValue
         case "Replace":
-          if (!Object.hasOwn(patch, "value")) return fail("malformed Replace patch")
           return patch.value
         case "Struct": {
           if (!Predicate.isObject(oldValue)) return fail("cannot apply a Struct patch to a non-object")
-          if (!Predicate.isObject(patch.fields)) return fail("malformed Struct patch")
           let output: Record<string, unknown> | undefined
           for (const name of Object.keys(patch.fields)) {
             const field = fields.get(name)
-            if (field === undefined) return fail(`unknown struct field ${JSON.stringify(name)}`)
+            if (field === undefined) continue
             const rawFieldPatch = ownValue(patch.fields, name)
-            if (!Predicate.isObject(rawFieldPatch) || typeof rawFieldPatch._tag !== "string") {
-              return fail("malformed field patch")
-            }
             const fieldPatch = rawFieldPatch as RuntimePatch
             if (fieldPatch._tag === "Remove") {
-              if (!field.optional) return fail(`cannot remove required field ${JSON.stringify(name)}`)
               if (Object.hasOwn(oldValue, name)) {
                 output ??= clone(oldValue)
                 delete output[name]
@@ -324,7 +293,7 @@ const derive = (ast: SchemaAST.AST): RuntimeDelta => {
     return runtime
   }
 
-  const kind: RuntimeDelta["kind"] = isAppendString(ast) ? "string" : isAppendArray(ast) ? "array" : "replace"
+  const kind = descriptor.kind
   const diff = (oldValue: unknown, newValue: unknown): RuntimePatch =>
     Object.is(oldValue, newValue) ? empty : { _tag: "Replace", value: newValue }
   const runtime: RuntimeDelta = {
@@ -339,10 +308,8 @@ const derive = (ast: SchemaAST.AST): RuntimeDelta => {
         case "Empty":
           return oldValue
         case "Replace":
-          if (!Object.hasOwn(patch, "value")) return fail("malformed Replace patch")
           return patch.value
         case "Append":
-          if (!Object.hasOwn(patch, "value")) return fail("malformed Append patch")
           if (kind === "string" && typeof oldValue === "string" && typeof patch.value === "string") {
             return patch.value.length === 0 ? oldValue : oldValue + patch.value
           }
@@ -366,7 +333,9 @@ const derive = (ast: SchemaAST.AST): RuntimeDelta => {
 
 /** Derives a delta from the decoded shape of an Effect Schema. */
 export const make = <S extends Schema.Schema<unknown>>(schema: S): Delta<S> => {
-  const runtime = derive(schema.ast)
+  const descriptor = deriveDescriptor(schema)
+  const runtime = derive(descriptor)
+  let patchSchema: Schema.Codec<Patch<S>, Schema.Json> | undefined
   const combine = (first: RuntimePatch, second: RuntimePatch): RuntimePatch => {
     if (first._tag === "Empty") return second
     if (second._tag === "Empty") return first
@@ -382,9 +351,15 @@ export const make = <S extends Schema.Schema<unknown>>(schema: S): Delta<S> => {
   }
   return {
     empty: empty as Patch<S>,
+    get schema() {
+      return patchSchema ??= derivePatchSchema(descriptor) as Schema.Codec<Patch<S>, Schema.Json>
+    },
     diff: runtime.diff as Delta<S>["diff"],
     combine: combine as Delta<S>["combine"],
-    patch: ((oldValue, patch) => validate(apply(runtime, oldValue, patch as RuntimePatch))) as Delta<S>["patch"],
+    patch: ((oldValue, patch) => {
+      if (!isRuntimePatch(descriptor, patch)) return fail("malformed patch")
+      return validate(apply(runtime, oldValue, patch))
+    }) as Delta<S>["patch"],
     fromUpdate: runtime.fromFieldUpdate as Delta<S>["fromUpdate"]
   }
 }

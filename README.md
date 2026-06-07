@@ -53,6 +53,10 @@ AssistantMessageDelta.patch(message, controlled)
 //   usage: { outputTokens: 3 },
 //   status: "complete"
 // }
+
+const encoded = Schema.encodeSync(AssistantMessageDelta.schema)(controlled)
+const decoded = Schema.decodeUnknownSync(AssistantMessageDelta.schema)(encoded)
+AssistantMessageDelta.patch(message, decoded)
 ```
 
 ## Streaming over Effect RPC
@@ -65,7 +69,7 @@ backend can author patches directly and stream them to the frontend:
 const patch = AssistantMessageDelta.fromUpdate({
   content: { text: Delta.append(chunk) }
 })
-yield* Queue.offer(outgoing, Schema.decodeUnknownSync(PatchWire)(patch))
+yield* Queue.offer(outgoing, patch)
 
 // frontend
 yield* client.StreamMessage().pipe(
@@ -78,9 +82,9 @@ yield* client.StreamMessage().pipe(
 ```
 
 See [`examples/effect-rpc.ts`](./examples/effect-rpc.ts) for the shared RPC
-contract, backend handler, and frontend consumer. The example defines a small
-wire Schema for the patch subset accepted by that endpoint, so RPC validates
-patches at the transport boundary.
+contract, backend handler, and frontend consumer. The RPC success schema is
+`AssistantMessageDelta.schema`, so RPC validates patches at the transport
+boundary.
 
 `Delta.make(schema)` implements Effect's `Differ.Differ<Value, Patch>` and adds
 `fromUpdate`. Automatic string and array diffs conservatively replace. Append is
@@ -94,7 +98,15 @@ fields look like patch tags. Use `Delta.remove()` only for optional struct
 fields. `fromUpdate` converts these unambiguous authoring commands into plain,
 inspectable tagged patch objects.
 
-Version 0.1 does not expose a patch Schema. Validate external patch data with a
-Schema or another boundary validator before passing it to `patch`; unsupported
-or malformed operations may throw. Every patched result is synchronously
-validated against the decoded schema.
+`delta.schema` is a `Schema.Codec<Patch, Schema.Json>` for RPC and other JSON
+boundaries. Binary runtime sequences encode as one flat array and decode to an
+equivalent runtime tree: codec roundtrips preserve patch application, not tree
+identity. Replacement transport follows the value Schema's canonical JSON codec
+and may normalize decoded values, such as stripping accepted excess object
+properties. Encoding can still fail when that codec cannot represent a decoded
+value as JSON. Accessing `delta.schema` itself is total; unsupported canonical
+payloads fail when the corresponding Replace value is encoded or decoded.
+Unannotated declarations fail canonical transport unless they provide Effect
+`toCodecJson` or `toCodec` annotations; lossy `null` output is never emitted.
+Every patched result is also synchronously validated against the decoded value
+schema.
