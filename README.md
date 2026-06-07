@@ -8,15 +8,51 @@ Derive a patch from two decoded values, or directly control the operation:
 import { Schema } from "effect"
 import * as Delta from "effect-delta"
 
-const Message = Schema.Struct({ text: Schema.String })
-const MessageDelta = Delta.make(Message)
+const AssistantMessage = Schema.Struct({
+  id: Schema.String,
+  content: Schema.Struct({
+    text: Schema.String,
+    citations: Schema.Array(Schema.String)
+  }),
+  usage: Schema.Struct({ outputTokens: Schema.Number }),
+  status: Schema.Literals(["streaming", "complete"])
+})
+const AssistantMessageDelta = Delta.make(AssistantMessage)
 
-const derived = MessageDelta.diff({ text: "hello" }, { text: "hello world" })
-// { _tag: "Struct", fields: { text: { _tag: "Replace", value: "hello world" } } }
+const message: typeof AssistantMessage.Type = {
+  id: "msg-1",
+  content: { text: "Hello", citations: [] },
+  usage: { outputTokens: 1 },
+  status: "streaming"
+}
 
-const controlled = MessageDelta.fromUpdate({ text: Delta.append(" world") })
-MessageDelta.patch({ text: "hello" }, controlled)
-// { text: "hello world" }
+// Derive a sparse patch from two snapshots.
+const derived = AssistantMessageDelta.diff(message, {
+  ...message,
+  usage: { outputTokens: 2 },
+  status: "complete"
+})
+
+// Or author the operations directly when you already know what happened.
+const controlled = AssistantMessageDelta.fromUpdate({
+  content: {
+    text: Delta.append(", world!"),
+    citations: Delta.append(["https://effect.website"])
+  },
+  usage: { outputTokens: 3 },
+  status: "complete"
+})
+
+AssistantMessageDelta.patch(message, controlled)
+// {
+//   id: "msg-1",
+//   content: {
+//     text: "Hello, world!",
+//     citations: ["https://effect.website"]
+//   },
+//   usage: { outputTokens: 3 },
+//   status: "complete"
+// }
 ```
 
 ## Streaming over Effect RPC
